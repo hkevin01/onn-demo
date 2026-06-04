@@ -25,6 +25,10 @@ data/
 outputs/
 results/
 *.png
+# Allow committed README assets
+!docs/
+!docs/images/
+!docs/images/*.png
 *.pdf
 *.csv
 *.pth

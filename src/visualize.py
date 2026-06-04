@@ -193,11 +193,12 @@ def plot_operator_response(
     operator = layer.operator
     operator.eval()
 
-    x_vals = torch.linspace(-3, 3, 300).unsqueeze(1)  # (300, 1)
-    # Pad to in_features if needed
-    in_f = next(iter(operator.parameters())).shape[-1] if hasattr(operator, "coeffs") else 2
-    if x_vals.shape[1] < in_f:
-        x_vals = x_vals.expand(-1, in_f)
+    # Determine operator's in_features from the model
+    in_f = onn_model.in_features
+    x_scalar = torch.linspace(-3, 3, 300)  # (300,)
+    # Build full input: vary dim 0, keep other dims at zero
+    x_vals = torch.zeros(300, in_f)
+    x_vals[:, 0] = x_scalar
     x_vals = x_vals.to(device)
 
     with torch.no_grad():
@@ -205,10 +206,10 @@ def plot_operator_response(
 
     fig, ax = plt.subplots(figsize=(8, 4))
     for j in range(min(y_vals.shape[1], 8)):
-        ax.plot(x_vals[:, 0].cpu().numpy(), y_vals[:, j], alpha=0.7, label=f"neuron {j}")
+        ax.plot(x_scalar.numpy(), y_vals[:, j], alpha=0.7, label=f"neuron {j}")
 
     ax.set_title(f"Operator Response - Layer {layer_idx} ({onn_model.operator_name})", fontsize=12)
-    ax.set_xlabel("Input value (feature dim 0)")
+    ax.set_xlabel("Input value (feature dim 0, others=0)")
     ax.set_ylabel("Operator output")
     ax.legend(fontsize=7, ncol=2)
     ax.grid(alpha=0.3)

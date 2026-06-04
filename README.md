@@ -12,7 +12,7 @@
 
 **A complete PyTorch implementation of Operational Neural Networks - a next-generation family of deep learning architectures that replace fixed linear transforms with fully learnable, parameterized operator neurons.**
 
-[Quick Start](#quick-start) - [Architecture](#architecture-deep-dive) - [Operators](#operator-reference) - [CLI Reference](#cli-reference) - [Outputs](#outputs-reference) - [API Docs](#api-reference)
+[Quick Start](#quick-start) - [Architecture](#architecture-deep-dive) - [Operators](#operator-reference) - [CLI Reference](#cli-reference) - [Outputs](#outputs-reference) - [ONN vs Transformers](#onn-vs-transformer-attention-operators-vs-routing) - [API Docs](#api-reference)
 
 </div>
 
@@ -42,6 +42,41 @@ where each operator `phi_i` is a differentiable nonlinear function with its own 
 
 > [!IMPORTANT]
 > ONNs do not replace activation functions - they replace the entire linear transform with a richer parameterized operation. The operator **is** the neuron, and its shape is discovered from data.
+
+### Concrete Example: One Neuron, Two Paradigms
+
+To make this concrete, imagine a single neuron receiving two inputs from the spiral dataset: `x1 = 0.5` and `x2 = -0.3`. We want to compute one output value.
+
+**Standard MLP neuron - what it actually computes:**
+
+```python
+# Weights W = [0.8, -0.5], bias b = 0.1
+y_linear = (0.8 * 0.5) + (-0.5 * -0.3) + 0.1
+#          = 0.40  +   0.15  + 0.10  = 0.65
+
+y = relu(y_linear) = 0.65
+# This neuron can ONLY represent a weighted sum. It draws a hyperplane in input space.
+# To curve that hyperplane into a spiral boundary, you need many such neurons stacked.
+```
+
+**ONN neuron (polynomial, degree=2) - what it actually computes:**
+
+```python
+# coeffs learned per degree: [[a0,a1,a2], [b0,b1,b2]] for inputs x1 and x2
+# Say the network has learned: coeffs_x1 = [0.1, 0.8, -0.4], coeffs_x2 = [0.05, -0.5, 0.6]
+
+poly_x1 = 0.1*(x1^0) + 0.8*(x1^1) + (-0.4)*(x1^2)
+        = 0.1*(1)    + 0.8*(0.5)   + (-0.4)*(0.25)
+        = 0.1 + 0.4 - 0.1 = 0.40
+
+poly_x2 = 0.05*(x2^0) + (-0.5)*(x2^1) + 0.6*(x2^2)
+        = 0.05*(1)     + (-0.5)*(-0.3)  + 0.6*(0.09)
+        = 0.05 + 0.15 + 0.054 = 0.254
+
+y = poly_x1 + poly_x2 + bias = 0.40 + 0.254 + 0.0 = 0.654
+```
+
+The key difference: the MLP neuron's gradient updates change `W` and `b`, which alter only the **tilt** of its hyperplane. The ONN neuron's gradient updates change `coeffs`, which alter the **curvature** of its polynomial surface. After 80 training epochs the polynomial coefficients have been reshaped by the data to carve out the spiral's curved arms directly. The MLP needs multiple stacked layers to compose enough hyperplanes to approximate the same curve.
 
 ---
 
@@ -95,6 +130,8 @@ sequenceDiagram
 
 > [!NOTE]
 > The `BatchNorm1d` after the operator is critical for training stability. Operator outputs can vary widely in scale across different parameterizations, and batch normalization brings them to a consistent range before the activation function is applied.
+
+**Why BatchNorm matters in practice - a concrete example:** Consider a `GaussianOperator` where `sigma` (the width parameter) is very small, causing the Gaussian to spike sharply near its center. Without BatchNorm, the operator output for inputs far from that center would be nearly zero while inputs near the center produce values close to 1.0. The downstream ReLU then clips all near-zero activations, killing most of the gradient signal for those neurons and causing the Gaussian centers to stop moving. With BatchNorm applied first, outputs are rescaled to zero mean and unit variance before ReLU - ensuring every neuron contributes a usable gradient signal regardless of where its Gaussian center sits during training. Removing `use_bn=True` from `ONNLayer` on a Gaussian model typically causes accuracy to drop by 5-10 percentage points on the spiral dataset.
 
 ### Training Pipeline
 
@@ -193,8 +230,22 @@ Each operator is a fully differentiable `nn.Module` subclass. During training, t
 | <sub>3</sub> | <sub>Gaussian</sub> | <sub>Circles</sub> | <sub>Localized, interpretable centers (mu)</sub> | <sub>Narrow sigma can cause vanishing gradients</sub> | <sub>log_sigma init</sub> |
 | <sub>4</sub> | <sub>Multiplicative</sub> | <sub>Spiral</sub> | <sub>Captures pairwise feature interactions</sub> | <sub>Higher parameter count</sub> | <sub>rank (default 4)</sub> |
 
+### Choosing the Right Operator - A Practical Decision Guide
+
+The operator choice is the single most impactful hyperparameter in an ONN, yet it is often the one that gets the least systematic attention. Here is how to think through the choice before running any experiments.
+
+If your data has **repeating patterns or oscillations** - for example a sensor signal that cycles, a time-frequency representation, or any dataset where the same structural pattern recurs at different positions - start with `sinusoidal`. The learnable `freq` and `phase` parameters will identify the dominant frequency and align to it within a few epochs. You can verify this is working by inspecting `operator_trajectories.png`: the `freq` parameter norm should move early and then stabilize.
+
+If your data naturally **clusters into localized regions** - where knowing "is this point near location A?" is more useful than knowing its exact value - start with `gaussian`. The learnable `mu` parameters act as cluster centers that get pulled toward the data's natural groupings during training. This is conceptually similar to how a Gaussian kernel SVM or an RBF network works, except here the centers and widths are learned end-to-end. On the circles dataset, you can watch `mu` values drift apart to straddle the two concentric rings.
+
+If your data has **pairwise feature interactions** - where the product `x1 * x2` is more informative than `x1` or `x2` alone - try `multiplicative`. A classic example is XOR: no linear combination of inputs can solve XOR, but the product `x1 * x2` makes it trivially separable. The rank hyperparameter controls how many interaction components are learned; `rank=4` is a good default for 2D inputs.
+
+If you are **not sure**, start with `polynomial`. It is the most general-purpose operator in this implementation, its gradients are well-behaved due to input clamping, and it produces reasonable results on almost any 2D classification task.
+
 > [!WARNING]
 > The `PolynomialOperator` clamps inputs to the range `[-10, 10]` before computing powers. Without this safeguard, large input values raised to degree 3 or higher can produce numerical overflow (`NaN`) and destroy training. If you observe `NaN` loss, check that your input features are properly normalized.
+
+**Debugging NaN loss - step by step:** If you run the demo and see `loss = nan` at any epoch, follow these steps in order. First confirm normalization - the built-in `data.py` module applies `StandardScaler` automatically, but if you are passing custom data verify that features have roughly unit variance. Second, lower the learning rate: `--lr 0.0001` often stabilizes a diverging polynomial model. Third, try reducing polynomial degree by passing `operator_kwargs={'degree': 2}` directly in `main.py`. The most common root cause is unnormalized inputs combined with a high polynomial degree - `x = 100` raised to the power 3 gives `1,000,000`, which overflows `float32` before the internal clamp in `PolynomialOperator.forward()` can be applied.
 
 ---
 

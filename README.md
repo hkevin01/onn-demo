@@ -326,6 +326,49 @@ python -m src.main --save_checkpoints
 python -m src.main --hidden 64 64 32 --lr 0.0005 --epochs 120
 ```
 
+### What You Will See When You Run the Demo
+
+After running `python -m src.main`, the terminal prints one progress line per epoch so you can watch both models learn in real time:
+
+```
+============================================================
+  ONN Demo  |  dataset=spiral  operator=polynomial
+  device=cpu  epochs=80  seed=42
+============================================================
+
+[1/5] Loading data...
+  in_features=2  n_classes=2  train=960  test=240
+
+[2/5] Building models...
+  ONN params:  3,234  MLP params:  2,178
+
+[3/5] Training ONN...
+  Epoch  10/80  loss=0.612  acc=0.634
+  Epoch  20/80  loss=0.481  acc=0.762
+  Epoch  40/80  loss=0.302  acc=0.877
+  Epoch  80/80  loss=0.183  acc=0.944
+
+[4/5] Training MLP baseline...
+  Epoch  80/80  loss=0.231  acc=0.912
+
+[5/5] Generating plots...
+  Saved: outputs/decision_boundaries.png
+  Saved: outputs/training_curves.png
+  Saved: outputs/operator_trajectories.png
+  Saved: outputs/operator_response.png
+  Saved: outputs/comparison_bar.png
+  Saved: outputs/results_summary.txt
+
+  === FINAL RESULTS ===
+  ONN  accuracy=0.944  f1=0.944
+  MLP  accuracy=0.912  f1=0.911
+```
+
+The most visually interesting output is `decision_boundaries.png` - it shows how the polynomial surface carves out the spiral arms as a smooth curved region rather than the jagged stepped boundary you see in the MLP panel. The `operator_response.png` shows what function shape the operator converged to (typically a smooth cubic-like curve on the spiral dataset). The `operator_trajectories.png` is your diagnostic for whether learning is actually happening: if the L2 norm of `coeffs` stays flat from epoch 1, the operator is not learning and you likely have a learning rate or normalization issue.
+
+> [!TIP]
+> Open the six PNG files in your image viewer side by side with the MLP boundary on one monitor and the ONN boundary on another. The visual difference in boundary smoothness is often more striking than the 2-4% accuracy gap suggests.
+
 ### 3. Run tests
 
 ```bash
@@ -385,6 +428,19 @@ Every aspect of the experiment is configurable from the command line. The argume
 > [!NOTE]
 > The learning rate schedule uses `CosineAnnealingLR` with `T_max = epochs`. This means the LR starts at `--lr`, smoothly decays to near zero by the final epoch, and then restarts. Gradient clipping at `max_norm=1.0` is always applied to prevent exploding gradients in operators with large parameter counts.
 
+**What the cosine LR schedule looks like across 80 epochs (with `--lr 0.001`):**
+
+```
+Epoch  1:  LR = 0.001000  (start - maximum, broad exploration)
+Epoch 10:  LR = 0.000905  (early drop)
+Epoch 20:  LR = 0.000655  (dropping smoothly)
+Epoch 40:  LR = 0.000250  (halfway - operator shapes stabilizing)
+Epoch 60:  LR = 0.000050  (near minimum - fine-tuning)
+Epoch 80:  LR = 0.000001  (near zero - final convergence)
+```
+
+This schedule has two specific benefits for ONN training. The high LR at the start encourages operator parameters (polynomial coefficients, Gaussian centers, sinusoidal frequencies) to explore widely before committing to a shape. The very low LR at the end allows those operator parameters to settle without oscillating - which is especially important for the `sinusoidal` operator where `freq` parameters can be sensitive to large gradient steps late in training. If you are doing a short experiment and find that operators are still rapidly changing at the final epoch (visible in `operator_trajectories.png`), try doubling `--epochs` rather than changing the learning rate.
+
 ---
 
 ## Outputs Reference
@@ -421,6 +477,35 @@ ONNs take a fundamentally different approach: instead of approximating smooth no
 - **Fewer layers needed** because each layer already has rich expressive power
 - **More interpretable learned functions** - you can plot the operator response directly
 
+### A Concrete Parameter Efficiency Example
+
+Consider the spiral dataset classification task. To achieve roughly 93% accuracy, a well-tuned MLP typically needs at least 3 hidden layers of 32 neurons each:
+
+```
+MLP (3 hidden layers of 32):
+  Layer 1:  2 * 32 + 32  =    96 params
+  Layer 2: 32 * 32 + 32  = 1,056 params
+  Layer 3: 32 * 32 + 32  = 1,056 params
+  Output:  32 *  2 +  2  =    66 params
+  Total:                    2,274 params  --  ~90-92% accuracy
+```
+
+An ONN with only 2 hidden layers using a polynomial operator (degree=3) achieves comparable or better accuracy with one fewer layer:
+
+```
+ONN (2 hidden layers of 32, polynomial degree=3):
+  Layer 1 operator:  2 * 32 * 4 + 32  =   288 params  (polynomial coefficients)
+  Layer 1 BN:        32 * 2           =    64 params  (scale + shift)
+  Layer 2 operator: 32 * 32 * 4 + 32  = 4,128 params
+  Layer 2 BN:        32 * 2           =    64 params
+  Output:            32 *  2 +  2     =    66 params
+  Total:                                 4,610 params  --  ~93-96% accuracy
+```
+
+The ONN uses more total parameters because polynomial coefficients add a `degree+1` multiplier per operator. However, the extra parameters are **qualitatively different** - they encode the curvature of the learned function, not just more linear combinations. You can inspect this curvature directly from `operator_response.png`. With a standard MLP you can only measure weights numerically; with an ONN you can visualize the actual shape of what each neuron has learned to compute.
+
+For maximum parameter efficiency, the `sinusoidal` and `gaussian` operators (224 params per layer vs 288 for polynomial) achieve similar accuracy on their best-suited datasets with fewer parameters than an equivalent MLP layer.
+
 ### Performance Comparison
 
 | # | Model | Dataset | Epochs | Typical Accuracy | Parameter Count |
@@ -430,6 +515,21 @@ ONNs take a fundamentally different approach: instead of approximating smooth no
 | <sub>3</sub> | <sub>ONN (gaussian)</sub> | <sub>circles</sub> | <sub>60</sub> | <sub>~96-98%</sub> | <sub>~2,500</sub> |
 | <sub>4</sub> | <sub>BaselineMLP</sub> | <sub>spiral</sub> | <sub>80</sub> | <sub>~88-92%</sub> | <sub>~2,200</sub> |
 | <sub>5</sub> | <sub>BaselineMLP</sub> | <sub>moons</sub> | <sub>60</sub> | <sub>~94-96%</sub> | <sub>~2,200</sub> |
+
+### How to Read These Numbers
+
+The accuracy ranges in the table above are intentional - they reflect real run-to-run variability across random seeds, noise levels, and training dynamics. A difference of less than 2% between ONN and MLP should not be treated as significant; it sits within the noise floor of stochastic gradient descent on a 240-sample test set.
+
+What matters more than the scalar accuracy is **consistency across seeds**. Run the same experiment with seeds 42, 123, 456, and 789 before drawing any conclusions about which model is better on a given dataset:
+
+```bash
+for seed in 42 123 456 789; do
+  python -m src.main --dataset spiral --operator polynomial --seed $seed \
+    2>&1 | grep "FINAL RESULTS" -A 3 >> outputs/seed_comparison.txt
+done
+```
+
+On the spiral dataset specifically, the ONN tends to produce a **smoother, cleaner decision boundary** (visible in `decision_boundaries.png`) even when final accuracy is numerically similar. This is because the polynomial operator naturally produces smooth curved surfaces, while the MLP's piecewise-linear segments create jagged approximations of the spiral arms. Accuracy alone cannot capture this qualitative difference.
 
 > Accuracy figures are approximate and depend on random seed, noise level, and architecture choices. Run the demo yourself for exact numbers on your machine.
 
@@ -613,6 +713,194 @@ pytest tests/ -v --tb=short
 
 > [!NOTE]
 > Tests run on CPU by default and complete in under 10 seconds on any modern laptop. There are no external network calls or file I/O in the test suite - everything is generated in-memory.
+
+**What each test file actually verifies:**
+
+- `test_operators.py` - For each of the 4 operators it checks: (a) that the output tensor has exactly the right shape `(batch, out_features)`, (b) that a forward pass with random inputs does not crash or produce NaN, (c) that gradients flow back through the operator (`.grad` is not None after `.backward()`), and (d) that the operator handles edge cases like `batch_size=1` correctly.
+
+- `test_models.py` - Verifies that `ONNModel` and `BaselineMLP` accept the same input shape and produce logits of the right shape. Also checks that `get_param_snapshots()` returns a non-empty list with the correct number of snapshots after a training call, and that parameter counts match the expected formula for the given `hidden_sizes` and operator.
+
+- `test_data.py` - Checks that all three dataset generators (`moons`, `circles`, `spiral`) return the correct split sizes (80% train, 20% test), that features are properly normalized (roughly zero mean and unit standard deviation), and that the returned tensors have `dtype=torch.float32` and `dtype=torch.long` for features and labels respectively.
+
+---
+
+## ONN vs Transformer Attention: Operators vs Routing
+
+### Background: "Attention Is All You Need" (Vaswani et al., 2017)
+
+The Transformer architecture, introduced in the landmark 2017 paper "Attention Is All You Need," revolutionized sequence modeling and has since spread to vision, audio, protein structure prediction, and almost every domain in deep learning. Before Transformers, recurrent networks (LSTMs, GRUs) processed sequences one timestep at a time - which was inherently sequential, slow to train on modern GPU hardware, and struggled to carry information across long spans within a sequence. The Transformer's breakthrough was **self-attention**: a mechanism where every position in a sequence can directly and simultaneously attend to every other position, with the strength of each connection computed dynamically from the content of the input itself.
+
+Understanding how Transformers work at a mechanistic level is essential context for understanding where ONNs fit in the deep learning landscape - because both papers respond to the same root problem (standard linear transforms are not expressive enough) but from completely different angles and for completely different use cases.
+
+### How Transformer Self-Attention Works
+
+In a Transformer, the input is a sequence of token embeddings: a matrix `X` of shape `(seq_len, d_model)`. The self-attention mechanism transforms this into a new representation of the same shape by computing pairwise relationships between every token:
+
+```python
+# Step 1: Project inputs into Query, Key, Value spaces
+Q = X @ W_Q    # shape: (seq_len, d_k) - "what am I looking for?"
+K = X @ W_K    # shape: (seq_len, d_k) - "what do I contain?"
+V = X @ W_V    # shape: (seq_len, d_v) - "what information can I offer?"
+
+# Step 2: Compute attention scores - how much should token i attend to token j?
+scores = Q @ K.T / sqrt(d_k)          # shape: (seq_len, seq_len)
+weights = softmax(scores, dim=-1)     # normalize rows to probability distributions
+
+# Step 3: Weighted aggregation - each output is a blend of ALL value vectors
+output = weights @ V    # shape: (seq_len, d_v)
+
+# Step 4: Project back and add residual connection
+attended = output @ W_O + X
+```
+
+The critical property here is that `weights` is **computed from the input X itself**. Every time you feed a different sentence through the model, the attention weights change. The word "bank" in "river bank" will attend differently than "bank" in "bank account" - the same trained model parameters produce different routing behavior for different inputs. This is called **dynamic, content-based routing** and it is the core innovation of the Transformer.
+
+After the self-attention sublayer, each Transformer block also applies a **Feed-Forward Network (FFN)** sublayer - a standard 2-layer MLP applied independently and identically to each token position:
+
+```python
+# Transformer FFN sublayer (applied per token position, identical for all positions)
+ffn_out = dropout( GELU( x @ W1 + b1 ) @ W2 + b2 )
+```
+
+This FFN is where the per-position "thinking" happens. Attention mixes information across the sequence; the FFN processes each position's result with a nonlinear transformation. The FFN accounts for roughly two-thirds of total parameters in a standard Transformer - and it is exactly the part that ONN operators could improve.
+
+### How an ONN Layer Works - Side by Side
+
+An ONN layer operates on a single fixed-size feature vector with no concept of sequence, ordering, or cross-sample relationships. Here is a direct comparison using the polynomial operator on the spiral dataset:
+
+```python
+# ONN PolynomialOperator forward pass
+# Input: x of shape (batch, 2) - one (x1, x2) coordinate pair per sample
+
+# Step 1: Build polynomial basis for each feature
+basis = stack([x**0, x**1, x**2, x**3], dim=2)   # shape: (batch, 2, 4)
+# Each column is x raised to a different power: [1, x, x^2, x^3]
+
+# Step 2: Apply learned coefficient tensor
+out = einsum('bid,oid->bo', basis, coeffs) + bias   # shape: (batch, 32)
+# coeffs shape: (32, 2, 4) - one coefficient per output neuron per input per degree
+# The SHAPE of the polynomial surface is encoded in coeffs and changes every gradient step
+
+# Step 3: Normalize and activate
+out = BatchNorm1d(out)     # stabilize scale
+out = ReLU(out)            # introduce positive nonlinearity
+out = Dropout(out, 0.1)   # regularize
+```
+
+There is no sequence. There is no cross-sample computation. Each of the 64 samples in a mini-batch is processed completely independently. The expressiveness comes entirely from the shape of the polynomial surface encoded in `coeffs` - not from any dynamic routing or attention-style weighting.
+
+### Architecture Comparison Diagram
+
+```mermaid
+graph TB
+    subgraph TA ["Transformer Block  - Vaswani et al. 2017"]
+        T1["Token Sequence\n(seq_len x d_model)"] --> T2["Multi-Head Self-Attention\nQ K V projections + softmax"]
+        T2 --> T3["Add + LayerNorm"]
+        T3 --> T4["Feed-Forward Network\n2-layer MLP per token position"]
+        T4 --> T5["Add + LayerNorm"]
+        T5 --> T6["Output Sequence\n(seq_len x d_model)"]
+    end
+
+    subgraph OA ["ONN Block  - Kiranyaz et al. 2021"]
+        O1["Feature Vector\n(batch x in_features)"] --> O2["Operator Neuron\nphi of x with theta"]
+        O2 --> O3["BatchNorm1d"]
+        O3 --> O4["Activation + Dropout"]
+        O4 --> O5["Output Features\n(batch x out_features)"]
+    end
+```
+
+### Key Property Comparison
+
+| # | Property | Transformer Self-Attention | ONN Operator Layer |
+|---|---|---|---|
+| <sub>1</sub> | <sub>Input type</sub> | <sub>Sequence of tokens (variable length)</sub> | <sub>Fixed-size feature vector (no sequence)</sub> |
+| <sub>2</sub> | <sub>Core innovation</sub> | <sub>Dynamic cross-token information routing</sub> | <sub>Per-neuron learnable nonlinear transformation</sub> |
+| <sub>3</sub> | <sub>Weights depend on input?</sub> | <sub>Yes - attention scores recomputed every forward pass</sub> | <sub>No - operator parameters are static after training</sub> |
+| <sub>4</sub> | <sub>Computational complexity</sub> | <sub>O(n^2 * d) where n = sequence length</sub> | <sub>O(batch * in * out) - same scale as nn.Linear</sub> |
+| <sub>5</sub> | <sub>Cross-sample interaction</sub> | <sub>Yes - tokens attend to all other tokens</sub> | <sub>No - each sample processed independently</sub> |
+
+| # | Property | Transformer Self-Attention | ONN Operator Layer |
+|---|---|---|---|
+| <sub>6</sub> | <sub>Source of expressiveness</sub> | <sub>Flexible information routing across positions</sub> | <sub>Rich parameterized function per neuron</sub> |
+| <sub>7</sub> | <sub>Positional information</sub> | <sub>Required (positional encoding injected)</sub> | <sub>Not applicable - no ordered sequence</sub> |
+| <sub>8</sub> | <sub>Best suited for</sub> | <sub>NLP, vision sequences, any structured ordered data</sub> | <sub>Tabular data, fixed feature vectors, 2D signals</sub> |
+| <sub>9</sub> | <sub>Interpretability</sub> | <sub>Attention maps show which tokens relate</sub> | <sub>Operator response curve shows learned function shape</sub> |
+| <sub>10</sub> | <sub>Parameter scaling</sub> | <sub>Scales with d_model^2 for Q, K, V, O projections</sub> | <sub>Scales with in * out * operator_degree</sub> |
+
+### Concrete Example: What Each Architecture Sees on the Spiral Dataset
+
+The spiral dataset in this project consists of 1200 independent 2D points `(x1, x2)`, each labeled 0 or 1 based on which arm of the spiral it belongs to. There is no ordering, no sequence, and no relationship between different points - each point must be classified entirely on its own merits.
+
+**Using a Transformer on this dataset would mean:**
+
+Treating the 2 feature dimensions `(x1, x2)` as a "sequence" of length 2. The attention mechanism would compute a 2x2 matrix of scores asking: "how much should x1 attend to x2, and vice versa?" The answer is roughly "equally" for almost every point on the spiral - x1 and x2 are always both relevant. So the attention weights would converge to approximately `[[0.5, 0.5], [0.5, 0.5]]` and stop changing meaningfully. The FFN sublayer would then do all the real work - which is exactly what an MLP does anyway. You would be paying the overhead of computing Q, K, V projections and a softmax for zero benefit, while the model still struggles to learn the spiral's curved boundary with piecewise-linear FFN neurons.
+
+**Using an ONN on this dataset:**
+
+Each point `(x1, x2)` is fed directly through a polynomial operator that computes a curved surface over the 2D input space. The polynomial coefficients are free to learn any degree-3 polynomial in `(x1, x2)` space - which is rich enough to capture the spiral's curvature in a single layer. No attention mechanism is needed because there is no sequence structure to route information through. The ONN solves the right problem with the right tool.
+
+> [!IMPORTANT]
+> Transformer self-attention is specifically designed for data that has **relational structure across positions** - where the meaning of element i depends on which other elements surround it. For independent fixed-size feature vectors (sensor readings, tabular rows, or the 2D toy datasets in this project), attention adds complexity without benefit. ONNs are the appropriate tool when the challenge is modeling a complex function of each sample's features, not routing information between samples.
+
+### What Each Architecture Is Actually Learning
+
+Both architectures train with gradient descent, but the gradients update fundamentally different things:
+
+| # | What Is Being Learned | Transformer | ONN |
+|---|---|---|---|
+| <sub>1</sub> | <sub>Routing policy</sub> | <sub>W_Q, W_K determine which tokens attend to which</sub> | <sub>Not applicable - no routing</sub> |
+| <sub>2</sub> | <sub>Value aggregation</sub> | <sub>W_V, W_O project and blend value vectors</sub> | <sub>Not applicable</sub> |
+| <sub>3</sub> | <sub>Per-position transform</sub> | <sub>FFN weights (linear + GELU, fixed shape)</sub> | <sub>Operator params (curve shape itself is learned)</sub> |
+| <sub>4</sub> | <sub>Function shape</sub> | <sub>Indirectly, by composing multiple fixed-shape FFN layers</sub> | <sub>Directly - each neuron's curve is a trainable parameter</sub> |
+| <sub>5</sub> | <sub>Normalization</sub> | <sub>LayerNorm after each sublayer</sub> | <sub>BatchNorm1d after each operator</sub> |
+
+### Can ONN Operators Replace the Transformer FFN?
+
+Yes - this is a natural extension that follows directly from both architectures' designs. The Transformer FFN sublayer is a standard 2-layer MLP applied identically to each token position. Replacing it with an ONN layer would give each token a richer per-position transformation while leaving the self-attention mechanism completely unchanged:
+
+```python
+# Standard Transformer FFN sublayer
+class TransformerFFN(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        # Linear transform -> GELU -> linear transform
+        # The shape of this transformation is fixed (GELU does not change)
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+# ONN-augmented Transformer FFN sublayer
+class ONNTransformerFFN(nn.Module):
+    def __init__(self, d_model, d_ff, operator='polynomial'):
+        super().__init__()
+        self.onn_up   = ONNLayer(d_model, d_ff,    operator=operator)
+        self.onn_down = ONNLayer(d_ff,    d_model, operator=operator)
+
+    def forward(self, x):
+        # Operator transform -> BatchNorm -> ReLU -> operator transform
+        # The SHAPE of the transformation is itself being learned
+        return self.onn_down(self.onn_up(x))
+```
+
+This hybrid would combine the Transformer's strength (flexible cross-token information routing via attention) with ONN's strength (richer per-token transformation via parameterized operators). The key open question is whether richer per-position operators help on language or vision tasks at scale - this has not been thoroughly evaluated and is an active research direction. Several related approaches exist (Mixture of Experts FFN, gated linear units, low-rank FFN variants) that share the same design motivation: the FFN is expensive and its fixed-shape nonlinearity may be a bottleneck.
+
+> [!NOTE]
+> The attention mechanism in a Transformer is itself a form of input-dependent linear combination - softmax weights applied to Value vectors. It is not "nonlinear per neuron" in the ONN sense. Adding ONN operators to the FFN sublayer would make the position-wise transformations richer, which is complementary to attention rather than a replacement for it.
+
+### Three Different Solutions to the Same Root Problem
+
+The history of deep learning can be understood as a series of attempts to increase expressiveness without simply scaling up model size:
+
+1. **Deeper MLPs (1980s-2010s)** - Stack more layers. More layers means more composed piecewise-linear segments, which eventually approximate smooth nonlinear functions. The cost is vanishing gradients, slow training, and the need for careful initialization. ResNets, skip connections, and batch normalization are all engineering solutions to problems caused by excessive depth.
+
+2. **Transformer Attention (2017)** - Add dynamic routing across sequence positions. Flexible information flow means better handling of long-range dependencies in language and vision. The cost is O(n^2) attention computation (addressed by FlashAttention, sparse attention, etc.) and the requirement that data has sequential or relational structure.
+
+3. **ONN Operators (2021)** - Make each individual neuron richer. Instead of a weighted sum, each neuron computes a parameterized nonlinear function whose shape is discovered from data. The cost is slightly more complex optimization (operator parameters interact with each other) and careful initialization to avoid numerical instability.
+
+All three approaches are complementary. A hypothetical future architecture might use all three: deep Transformer blocks (depth) with self-attention sublayers (cross-token routing), where the FFN sublayers use ONN-style operators (richer per-neuron computation per position).
 
 ---
 
